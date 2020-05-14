@@ -4,10 +4,8 @@ import datetime
 import math
 import json
 from urllib.parse import urlencode
-from pprint import pprint
+import psycopg2 as pg
 import re
-import copy
-import operator
 
 APP_ID = int(input('Введите APP_ID: '))
 OUTH_URL = 'https://oauth.vk.com/authorize'
@@ -22,7 +20,16 @@ print('Перейдите по ссылке ниже, скопируйте acces
 print('?'.join((OUTH_URL, urlencode(OUTH_PARAMS))))
 token = input()
 
-def main():
+def vkinder_start():
+    dbname = input('Введите название базы данных: ')
+    user = input('Введите логин: ')
+    password = input('Введите пароль: ')
+    with pg.connect(dbname=dbname,
+                    user=user,
+                    password=password
+                    ) as conn:
+
+        cur = conn.cursor()
     while True:
         uid = input('Введите ID (Nickname) пользователя')
         with timer() as t:
@@ -32,6 +39,9 @@ def main():
             top10 = find_top10(interests_dict)
             print('Поиск 3 самых популярных фотографий среди пользователей')
             photo_dict = find_photos(top10)
+            create_db(cur)
+            add_user(user1.uid, photo_dict, cur)
+            conn.commit()
             if user1.uid is None:
                 continue
             with open('photos.json', 'w', encoding='utf-8') as f:
@@ -49,6 +59,25 @@ def main():
                 continue
             elif next_step == 'q':
                 break
+
+def create_db(cur):
+    cur.execute("""
+            CREATE TABLE if not exists match_users(
+                id serial PRIMARY KEY,
+                input_user_id varchar(100) not NULL,
+                match_user_id varchar(100) not NULL,
+                rate numeric(10, 0) not NULL,
+                photo_url varchar(100) not NULL,
+                likes numeric(10, 0) not NULL
+            );
+            """)
+
+def add_user(user_id, photo_dict,cur):
+    for keys, values in photo_dict.items():
+        for value in values[1]:
+            cur.execute(f"insert into match_users (input_user_id, match_user_id, rate, photo_url, likes) values"
+                        " (%s,%s,%s,%s,%s)", (user_id, keys, values[0]['rate'],value['photo_id'], value['likes']))
+
 
 def user_get(uid):
     url = 'https://api.vk.com/method/users.get'
@@ -73,14 +102,19 @@ def find_interest(interests, result, key, w, interests_dict):
     for interest in interests:
         pattern = re.compile(r'{}'.format(interest), re.IGNORECASE)
         for i in result:
-            if key in i.keys() and\
-                    i[key] != '' and\
-                    pattern.findall(i[key]) != [] and\
-                    ('relation_partner' not in i.keys()) and i['last_seen']['time'] > 1588291200:
-                if i['id'] not in interests_dict.keys():
-                    interests_dict[i['id']] = list()
-                interests_dict[i['id']].append(len(pattern.findall(i[key]))*w)
-                interests_list.append(i['id'])
+            if key in i.keys() and i[key] != '' and pattern.findall(i[key]) != []:
+                if 'relation' in i.keys() and 'last_seen' in i.keys() and i['last_seen']['time'] > 1588291200:
+                    if i['relation'] == 1 or i['relation'] == 6 or i['relation'] == 0:
+                        if i['id'] not in interests_dict.keys():
+                            interests_dict[i['id']] = list()
+                        interests_dict[i['id']].append(len(pattern.findall(i[key])) * w)
+                        interests_list.append(i['id'])
+                elif 'relation' not in i.keys() and 'last_seen' in i.keys() and \
+                        i['last_seen']['time'] > 1588291200:
+                    if i['id'] not in interests_dict.keys():
+                        interests_dict[i['id']] = list()
+                    interests_dict[i['id']].append(len(pattern.findall(i[key])) * w)
+                    interests_list.append(i['id'])
     return interests_list
 
 def find_photos(top10):
@@ -102,24 +136,29 @@ def find_photos(top10):
             'count': 1000,
             'extended': 1
         }
-        response = requests.get(url, params=params)
+        repeat = True
+        while repeat:
+            response = requests.get(url, params=params)
+            if 'error' in response.json() and 'error_code' in response.json()['error'] and response.json()['error'][
+                'error_code'] == 6:
+                time.sleep(0.34)
+            else:
+                repeat = False
         photos = response.json()['response']['items']
         photo_list = []
         for photo in photos:
-            try:
+            if 'photo_2560' in photo.keys():
                 photo_list.append({'likes': photo['likes']['count'], 'photo_id': photo['photo_2560']})
-            except KeyError:
-                try:
-                    photo_list.append({'likes': photo['likes']['count'], 'photo_id': photo['photo_1280']})
-                except KeyError:
-                    try:
-                        photo_list.append({'likes': photo['likes']['count'], 'photo_id': photo['photo_807']})
-                    except KeyError:
-                        photo_list.append({'likes': photo['likes']['count'], 'photo_id': photo['photo_604']})
+            elif 'photo_1280' in photo.keys():
+                photo_list.append({'likes': photo['likes']['count'], 'photo_id': photo['photo_1280']})
+            elif 'photo_807' in photo.keys():
+                photo_list.append({'likes': photo['likes']['count'], 'photo_id': photo['photo_807']})
+            elif 'photo_604' in photo.keys():
+                photo_list.append({'likes': photo['likes']['count'], 'photo_id': photo['photo_604']})
         photo_dict[key].append(photo_list)
     for keys, values in photo_dict.items():
         values[1].sort(key=lambda x: x['likes'], reverse=True)
-        values[1] = values[1][-3:]
+        values[1] = values[1][:3]
     return photo_dict
 
 def find_top10(interests_dict):
@@ -131,13 +170,14 @@ def find_top10(interests_dict):
         total = 0
     top_10 = list(interests_dict.items())
     top_10.sort(key=lambda i: i[1], reverse=True)
-    top_10 = top_10[-10:]
+    top_10 = top_10[:10]
     return top_10
 
 class User:
     def __init__(self, uid):
         self.user_info = user_get(uid)
         self.uid = self.user_info['response'][0]['id']
+        self.id = 'id'+str(self.uid)
         self.link = 'https://vk.com/id' + str(self.uid)
         self.groups_list = []
 
@@ -216,7 +256,11 @@ class User:
             match_uid_list += find_interest(games, result, 'games', w_games, interests_dict)
             if match_uid_list == []:
                 for i in result:
-                    match_uid_list.append(i['id'])
+                    if 'relation' in i.keys() and 'last_seen' in i.keys() and i['last_seen']['time'] > 1588291200:
+                        if i['relation'] == 1 or i['relation'] == 6 or i['relation'] == 0:
+                            match_uid_list.append(i['id'])
+                    elif 'relation' not in i.keys() and 'last_seen' in i.keys() and i['last_seen']['time'] > 1588291200:
+                        match_uid_list.append(i['id'])
             return set(match_uid_list), interests_dict
 
     def get_mutual_groups_friends(self):
@@ -227,8 +271,6 @@ class User:
         user_ids = list(user_ids)
         if len(user_ids) > 328:
             user_ids = user_ids[:328]
-        # user_ids_str = list(map(str, user_ids))
-        # user_ids_str = ','.join(user_ids_str)
         user_count = len(user_ids)
         print(f'Найдено {user_count} совпадений по интересам')
         print('Поиск пользователей, имеющих общие группы и общих друзей')
@@ -277,46 +319,6 @@ class User:
             user_count -= 1
             print(f'Осталось обработать {user_count+1} пользователей')
         return interests_dict
-        # pprint(interests_dict)
-        # group_ids = self.get_groups(self.uid)
-        # for group in group_ids:
-        #     time.sleep(0.34)
-        #     url = 'https://api.vk.com/method/groups.isMember'
-        #     params = {
-        #         'v': 5.52,
-        #         'access_token': token,
-        #         'group_id': group,
-        #         'user_ids': user_ids_str
-        #     }
-        #     response = requests.get(url, params=params)
-        #     repeat = True
-        #     try:
-        #         while repeat:
-        #             time.sleep(0.34)
-        #             response = requests.get(url, params=params)
-        #             print(response.json())
-        #             if 'error' in response.json() and 'error_code' in response.json()['error'] and \
-        #                     response.json()['error']['error_code'] == 6:
-        #                 time.sleep(0.34)
-        #             else:
-        #                 repeat = False
-        #         if 'error' in response.json() and 'error_code' in response.json()['error'] and response.json()['error'][
-        #             'error_code'] == 15:
-        #             raise GroupAccessDenied()
-        #         if 'error' in response.json() and 'error_code' in response.json()['error'] and response.json()['error'][
-        #             'error_code'] == 203:
-        #             raise GroupAccessDenied()
-        #     except GroupAccessDenied:
-        #         print(f'Отсутсвует доступ в группу с id {group}')
-        #     else:
-        #         for i in range(len(response.json()['response'])):
-        #             if response.json()['response'][i]['member'] == 1:
-        #                 print(response.json()['response'][i]['user_id'])
-        #                 new_user_ids.append(response.json()['response'][i]['user_id'])
-        # for user in set(new_user_ids):
-        #     if user not in interests_dict.keys():
-        #         interests_dict[user] = list()
-        #     interests_dict[user].append(1)
 
     def get_groups(self, user_id):
         url = 'https://api.vk.com/method/groups.get'
@@ -384,4 +386,5 @@ class PrivateUserProfile(Exception):
 class InvalidUserID(Exception):
     pass
 
-main()
+if __name__ == '__main__':
+    vkinder_start()
